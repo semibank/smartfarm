@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import SensorCard from './SensorCard';
-import { saveCardConfigs, loadCardConfigs, type SensorCardConfig } from '../utils/cardStorage';
-import { extractTopicsFromMessages, getLatestValueForTopic, isNumericTopic, guessTopicUnit, guessTopicDisplayName, guessTopicIcon, SENSOR_ICONS, COMMON_UNITS, type MqttMessage } from '../utils/topicUtils';
+import SwitchCard from './SwitchCard';
+import { saveCardConfigs, loadCardConfigs, type SensorCardConfig, type SwitchCardConfig, type CardConfig, CardType, createBinarySwitchCard, createTripleSwitchCard } from '../utils/cardStorage';
+import { extractTopicsFromMessages, getLatestValueForTopic, isNumericTopic, guessTopicUnit, guessTopicDisplayName, guessTopicIcon, SENSOR_ICONS, SWITCH_ICONS, COMMON_UNITS, filterSwitchTopics, filterStateTopics, filterCommandTopics, findMatchingCommandTopic, createDefaultValueMapping, type MqttMessage } from '../utils/topicUtils';
 import { findNextAvailablePosition, rearrangeCards, constrainToContainer, removeOverlaps, snapToGrid, resolveCollisionsDuringDrag, debounce, type CardLayout } from '../utils/cardLayoutUtils';
 import { dataHistoryManager } from '../utils/dataHistory';
 
@@ -14,6 +15,7 @@ interface SensorCardManagerProps {
     lastUpdated: Date;
   };
   messages: MqttMessage[];
+  publish: (topic: string, message: string) => void;
   getTemperatureStatus: (temp: number) => 'low' | 'normal' | 'warning' | 'danger';
   getHumidityStatus: (humidity: number) => 'low' | 'normal' | 'warning' | 'danger';
   getSoilMoistureStatus: (moisture: number) => 'low' | 'normal' | 'warning' | 'danger';
@@ -23,13 +25,14 @@ interface SensorCardManagerProps {
 const SensorCardManager: React.FC<SensorCardManagerProps> = ({
   sensorData,
   messages,
+  publish,
   getTemperatureStatus,
   getHumidityStatus,
   getSoilMoistureStatus,
   getLightStatus
 }) => {
   const [isEditing, setIsEditing] = useState(false);
-  const [cards, setCards] = useState<SensorCardConfig[]>([]);
+  const [cards, setCards] = useState<CardConfig[]>([]);
   const [showAddModal, setShowAddModal] = useState(false);
   const [newCardTemplate, setNewCardTemplate] = useState({
     title: '',
@@ -40,7 +43,18 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
     customUnit: false,
     isCalculated: false,
     calculationType: 'average' as 'average' | 'sum' | 'difference' | 'max' | 'min' | 'ratio',
-    sourceCards: [] as string[]
+    sourceCards: [] as string[],
+    cardType: 'sensor' as 'sensor' | 'switch',
+    switchType: 'binary' as 'binary' | 'triple',
+    // 스위치 MQTT 설정
+    mqttEnabled: false,
+    stateTopic: '',
+    commandTopic: '',
+    onValue: 'ON',
+    offValue: 'OFF',
+    state1Value: 'CLOSE',
+    state2Value: 'STOP',
+    state3Value: 'OPEN'
   });
   const [selectedTopic, setSelectedTopic] = useState('');
   const [editingCard, setEditingCard] = useState<string | null>(null);
@@ -119,11 +133,94 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
     }
   };
 
-  const handleCardEdit = (id: string, updates: Partial<SensorCardConfig>) => {
+  const handleCardEdit = (id: string, updates: Partial<CardConfig>) => {
     setCards(prevCards =>
       prevCards.map(card =>
         card.id === id ? { ...card, ...updates } : card
       )
+    );
+  };
+
+  const handleSwitchStateChange = (id: string, newState: number) => {
+    console.log(`🔄 스위치 상태 변경 요청 - ID: ${id}, 새 상태: ${newState}`);
+    
+    const card = cards.find(c => c.id === id && c.cardType === CardType.SWITCH) as SwitchCardConfig;
+    
+    if (!card) {
+      console.error(`❌ 스위치 카드를 찾을 수 없음 - ID: ${id}`);
+      return;
+    }
+    
+    console.log(`📋 카드 정보:`, {
+      title: card.title,
+      type: card.switchData.type,
+      currentState: card.switchData.state,
+      mqtt: card.switchData.mqtt
+    });
+    
+    if (card.switchData.mqtt && card.switchData.mqtt.commandTopic) {
+      // MQTT 제어 명령 전송
+      const mqtt = card.switchData.mqtt;
+      let commandValue = '';
+      
+      if (card.switchData.type === 'BINARY') {
+        commandValue = newState === 1 ? mqtt.valueMapping.on : mqtt.valueMapping.off;
+        console.log(`🔀 Binary 스위치 - 상태 ${newState} -> 값 "${commandValue}"`);
+      } else if (card.switchData.type === 'TRIPLE') {
+        if (newState === 0) commandValue = mqtt.valueMapping.state1 || 'CLOSE';
+        else if (newState === 1) commandValue = mqtt.valueMapping.state2 || 'STOP';
+        else if (newState === 2) commandValue = mqtt.valueMapping.state3 || 'OPEN';
+        console.log(`🔀 Triple 스위치 - 상태 ${newState} -> 값 "${commandValue}"`);
+      }
+      
+      if (commandValue) {
+        console.log(`📤 MQTT 명령 전송:`, {
+          topic: mqtt.commandTopic,
+          value: commandValue,
+          valueType: typeof commandValue,
+          timestamp: new Date().toISOString()
+        });
+        
+        // 상태 토픽과 제어 토픽 비교 로그
+        if (mqtt.stateTopic) {
+          console.log(`🔄 토픽 비교:`, {
+            stateTopic: mqtt.stateTopic,
+            commandTopic: mqtt.commandTopic,
+            topicsMatch: mqtt.stateTopic.replace(/\/(state|status|get)$/i, '') === mqtt.commandTopic.replace(/\/(set|command|cmd|control)$/i, '')
+          });
+        }
+        
+        try {
+          publish(mqtt.commandTopic, commandValue);
+          console.log(`✅ MQTT 명령 전송 성공`);
+        } catch (error) {
+          console.error(`❌ MQTT 명령 전송 실패:`, error);
+        }
+      } else {
+        console.warn(`⚠️ 명령 값이 비어있음 - 전송하지 않음`);
+      }
+    } else {
+      console.warn(`⚠️ MQTT 설정이 없거나 제어 토픽이 없음:`, {
+        hasMqtt: !!card.switchData.mqtt,
+        commandTopic: card.switchData.mqtt?.commandTopic
+      });
+    }
+    
+    // 로컬 상태 업데이트 (즉시 반영용, MQTT 응답으로 다시 업데이트됨)
+    console.log(`🔄 로컬 상태 업데이트: ${card.switchData.state} -> ${newState}`);
+    setCards(prevCards =>
+      prevCards.map(card => {
+        if (card.id === id && card.cardType === CardType.SWITCH) {
+          return {
+            ...card,
+            switchData: {
+              ...card.switchData,
+              state: newState
+            }
+          } as SwitchCardConfig;
+        }
+        return card;
+      })
     );
   };
   
@@ -209,8 +306,6 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
   };
 
   const handleAddCard = () => {
-    const mqttTopic = newCardTemplate.mqttTopic || (newCardTemplate.dataSource === 'mqtt' ? selectedTopic : '');
-    
     // Convert existing cards to CardLayout format for position calculation
     const existingLayouts: CardLayout[] = cards.map(card => ({
       id: card.id,
@@ -221,36 +316,81 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
     const newCardSize = { width: 275, height: 160 };
     const newPosition = findNextAvailablePosition(existingLayouts, newCardSize);
     
-    const newCard: SensorCardConfig = {
-      id: `card-${Date.now()}`,
-      title: newCardTemplate.title || (mqttTopic ? guessTopicDisplayName(mqttTopic) : 
-             newCardTemplate.isCalculated ? `${newCardTemplate.calculationType} 계산` : '새 센서'),
-      value: newCardTemplate.isCalculated ? 0 : getSensorValue(newCardTemplate.dataSource, mqttTopic),
-      unit: newCardTemplate.unit || (mqttTopic ? guessTopicUnit(mqttTopic) : ''),
-      status: getSensorStatus(newCardTemplate.dataSource, mqttTopic),
-      lastUpdated: sensorData.lastUpdated,
-      position: newPosition,
-      size: newCardSize,
-      dataSource: newCardTemplate.isCalculated ? 'calculated' : newCardTemplate.dataSource,
-      mqttTopic: mqttTopic,
-      icon: newCardTemplate.icon || (mqttTopic ? guessTopicIcon(mqttTopic) : 
-            newCardTemplate.isCalculated ? '📊' : '📊'),
-      // 계산 카드 관련 필드
-      isCalculated: newCardTemplate.isCalculated,
-      calculationType: newCardTemplate.calculationType,
-      sourceCards: newCardTemplate.sourceCards,
-      // 기본 설정
-      displayType: 'number',
-      minValue: 0,
-      maxValue: 100,
-      offset: 0,
-      colorRanges: {
-        low: { min: 0, max: 20 },
-        normal: { min: 20, max: 60 },
-        warning: { min: 60, max: 80 },
-        danger: { min: 80, max: 100 }
+    let newCard: CardConfig;
+    
+    if (newCardTemplate.cardType === 'switch') {
+      // 스위치 카드 생성
+      const cardId = `card-${Date.now()}`;
+      const cardTitle = newCardTemplate.title || 
+                       (newCardTemplate.switchType === 'binary' ? '새 스위치' : '새 컨트롤러');
+      
+      // 기본 스위치 카드 생성
+      let baseCard: SwitchCardConfig;
+      if (newCardTemplate.switchType === 'triple') {
+        baseCard = createTripleSwitchCard(cardId, cardTitle, newPosition, newCardTemplate.icon);
+      } else {
+        baseCard = createBinarySwitchCard(cardId, cardTitle, newPosition, newCardTemplate.icon);
       }
-    };
+      
+      // MQTT 설정 추가
+      if (newCardTemplate.mqttEnabled && (newCardTemplate.stateTopic || newCardTemplate.commandTopic)) {
+        const valueMapping = newCardTemplate.switchType === 'binary' ? 
+          {
+            on: newCardTemplate.onValue,
+            off: newCardTemplate.offValue
+          } : 
+          {
+            on: newCardTemplate.onValue,
+            off: newCardTemplate.offValue,
+            state1: newCardTemplate.state1Value,
+            state2: newCardTemplate.state2Value,
+            state3: newCardTemplate.state3Value
+          };
+          
+        baseCard.switchData.mqtt = {
+          stateTopic: newCardTemplate.stateTopic,
+          commandTopic: newCardTemplate.commandTopic,
+          valueMapping
+        };
+      }
+      
+      newCard = baseCard;
+    } else {
+      // 기존 센서 카드 생성 로직
+      const mqttTopic = newCardTemplate.mqttTopic || (newCardTemplate.dataSource === 'mqtt' ? selectedTopic : '');
+      
+      newCard = {
+        id: `card-${Date.now()}`,
+        cardType: CardType.SENSOR,
+        title: newCardTemplate.title || (mqttTopic ? guessTopicDisplayName(mqttTopic) : 
+               newCardTemplate.isCalculated ? `${newCardTemplate.calculationType} 계산` : '새 센서'),
+        value: newCardTemplate.isCalculated ? 0 : getSensorValue(newCardTemplate.dataSource, mqttTopic),
+        unit: newCardTemplate.unit || (mqttTopic ? guessTopicUnit(mqttTopic) : ''),
+        status: getSensorStatus(newCardTemplate.dataSource, mqttTopic),
+        lastUpdated: sensorData.lastUpdated,
+        position: newPosition,
+        size: newCardSize,
+        dataSource: newCardTemplate.isCalculated ? 'calculated' : newCardTemplate.dataSource,
+        mqttTopic: mqttTopic,
+        icon: newCardTemplate.icon || (mqttTopic ? guessTopicIcon(mqttTopic) : 
+              newCardTemplate.isCalculated ? '📊' : '📊'),
+        // 계산 카드 관련 필드
+        isCalculated: newCardTemplate.isCalculated,
+        calculationType: newCardTemplate.calculationType,
+        sourceCards: newCardTemplate.sourceCards,
+        // 기본 설정
+        displayType: 'number',
+        minValue: 0,
+        maxValue: 100,
+        offset: 0,
+        colorRanges: {
+          low: { min: 0, max: 20 },
+          normal: { min: 20, max: 60 },
+          warning: { min: 60, max: 80 },
+          danger: { min: 80, max: 100 }
+        }
+      } as SensorCardConfig;
+    }
 
     setCards(prevCards => [...prevCards, newCard]);
     setShowAddModal(false);
@@ -263,7 +403,18 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
       customUnit: false,
       isCalculated: false,
       calculationType: 'average',
-      sourceCards: []
+      sourceCards: [],
+      cardType: 'sensor',
+      switchType: 'binary',
+      // 스위치 MQTT 설정 초기화
+      mqttEnabled: false,
+      stateTopic: '',
+      commandTopic: '',
+      onValue: 'ON',
+      offValue: 'OFF',
+      state1Value: 'CLOSE',
+      state2Value: 'STOP',
+      state3Value: 'OPEN'
     });
     setSelectedTopic('');
   };
@@ -349,20 +500,83 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
     }
   }, [cards]);
 
-  const updatedCards = cards.map(card => ({
-    ...card,
-    value: card.dataSource ? getSensorValue(card.dataSource, card.mqttTopic) : card.value,
-    status: card.dataSource ? getSensorStatus(card.dataSource, card.mqttTopic) : card.status,
-    lastUpdated: sensorData.lastUpdated
-  }));
+  const updatedCards = cards.map(card => {
+    if (card.cardType === CardType.SWITCH) {
+      // 스위치 카드 MQTT 상태 업데이트
+      const mqtt = card.switchData.mqtt;
+      if (mqtt && mqtt.stateTopic) {
+        const latestValue = getLatestValueForTopic(messages, mqtt.stateTopic);
+        
+        // 값 매핑을 통해 상태 결정
+        let newState = card.switchData.state;
+        
+        if (card.switchData.type === 'BINARY') {
+          if (latestValue === mqtt.valueMapping.on) {
+            newState = 1;
+          } else if (latestValue === mqtt.valueMapping.off) {
+            newState = 0;
+          }
+        } else if (card.switchData.type === 'TRIPLE') {
+          if (latestValue === mqtt.valueMapping.state1) {
+            newState = 0;
+          } else if (latestValue === mqtt.valueMapping.state2) {
+            newState = 1;
+          } else if (latestValue === mqtt.valueMapping.state3) {
+            newState = 2;
+          }
+        }
+        
+        return {
+          ...card,
+          switchData: {
+            ...card.switchData,
+            state: newState
+          }
+        };
+      }
+      return card;
+    } else {
+      // 센서 카드 업데이트 (기존 로직)
+      return {
+        ...card,
+        value: card.dataSource ? getSensorValue(card.dataSource, card.mqttTopic) : card.value,
+        status: card.dataSource ? getSensorStatus(card.dataSource, card.mqttTopic) : card.status,
+        lastUpdated: sensorData.lastUpdated
+      };
+    }
+  });
   
   // Get available topics from messages
   const availableTopics = extractTopicsFromMessages(messages);
   const numericTopics = availableTopics.filter(topic => isNumericTopic(messages, topic));
   
   const handleEditTopic = (cardId: string) => {
-    setEditingCard(cardId);
-    setEditTopicModal(true);
+    const card = cards.find(c => c.id === cardId);
+    if (card) {
+      setEditingCard(cardId);
+      
+      if (card.cardType === CardType.SWITCH) {
+        // 스위치 카드의 경우 기존 MQTT 설정 로드
+        const mqtt = card.switchData.mqtt;
+        if (mqtt) {
+          setNewCardTemplate(prev => ({
+            ...prev,
+            stateTopic: mqtt.stateTopic || '',
+            commandTopic: mqtt.commandTopic || '',
+            onValue: mqtt.valueMapping.on || 'ON',
+            offValue: mqtt.valueMapping.off || 'OFF',
+            state1Value: mqtt.valueMapping.state1 || 'CLOSE',
+            state2Value: mqtt.valueMapping.state2 || 'STOP',
+            state3Value: mqtt.valueMapping.state3 || 'OPEN'
+          }));
+        }
+      } else {
+        // 센서 카드의 경우 기존 토픽 설정
+        setSelectedTopic(card.mqttTopic || '');
+      }
+      
+      setEditTopicModal(true);
+    }
   };
   
   const handleEditIcon = (cardId: string) => {
@@ -401,14 +615,41 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
     setSelectedIcon('');
   };
   
-  const handleSaveTopicEdit = (newTopic: string) => {
+  const handleSaveTopicEdit = (newTopic?: string) => {
     if (editingCard) {
-      handleCardEdit(editingCard, { 
-        mqttTopic: newTopic,
-        title: guessTopicDisplayName(newTopic),
-        unit: guessTopicUnit(newTopic),
-        icon: guessTopicIcon(newTopic)
-      });
+      const card = cards.find(c => c.id === editingCard);
+      
+      if (card?.cardType === CardType.SWITCH) {
+        // 스위치 카드 MQTT 설정 업데이트
+        const valueMapping = {
+          on: newCardTemplate.onValue,
+          off: newCardTemplate.offValue,
+          state1: newCardTemplate.state1Value,
+          state2: newCardTemplate.state2Value,
+          state3: newCardTemplate.state3Value
+        };
+        
+        const newSwitchData = {
+          ...card.switchData,
+          mqtt: {
+            stateTopic: newCardTemplate.stateTopic,
+            commandTopic: newCardTemplate.commandTopic,
+            valueMapping
+          }
+        };
+        
+        handleCardEdit(editingCard, { 
+          switchData: newSwitchData
+        });
+      } else if (newTopic) {
+        // 센서 카드 토픽 업데이트
+        handleCardEdit(editingCard, { 
+          mqttTopic: newTopic,
+          title: guessTopicDisplayName(newTopic),
+          unit: guessTopicUnit(newTopic),
+          icon: guessTopicIcon(newTopic)
+        });
+      }
     }
     setEditTopicModal(false);
     setEditingCard(null);
@@ -591,59 +832,32 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
       >
         {isEditing ? (
           // Edit Mode - Absolute positioned cards
-          updatedCards.map(card => (
-            <SensorCard
-              key={card.id}
-              id={card.id}
-              title={card.title}
-              value={card.value}
-              unit={card.unit}
-              status={card.status}
-              lastUpdated={card.lastUpdated}
-              position={card.position}
-              size={card.size}
-              icon={card.icon}
-              onEdit={handleCardEdit}
-              onDelete={handleCardDelete}
-              onMove={handleCardMove}
-              onResize={handleCardResize}
-              isEditing={isEditing}
-              onEditTopic={handleEditTopic}
-              onEditIcon={handleEditIcon}
-              editingCardId={editingCard}
-              displayType={card.displayType}
-              minValue={card.minValue}
-              maxValue={card.maxValue}
-              onEditDisplay={handleEditDisplay}
-              offset={card.offset}
-              colorRanges={card.colorRanges}
-              calculationType={card.calculationType}
-              sourceCards={card.sourceCards}
-              isCalculated={card.isCalculated}
-              allCards={updatedCards}
-            />
-          ))
-        ) : (
-          // Normal Mode - Absolute layout for consistency
-          <div style={{
-            position: 'relative',
-            width: '100%',
-            height: '600px',
-            padding: '0 20px'
-          }}>
-            {updatedCards.map(card => (
-              <div 
-                key={card.id} 
-                style={{ 
-                  position: 'absolute',
-                  left: `${card.position.x}px`,
-                  top: `${card.position.y}px`,
-                  width: `${card.size.width}px`,
-                  height: `${card.size.height}px`,
-                  zIndex: 1
-                }}
-              >
+          updatedCards.map(card => {
+            if (card.cardType === CardType.SWITCH) {
+              return (
+                <SwitchCard
+                  key={card.id}
+                  id={card.id}
+                  title={card.title}
+                  switchData={card.switchData}
+                  position={card.position}
+                  size={card.size}
+                  icon={card.icon}
+                  onEdit={handleCardEdit}
+                  onDelete={handleCardDelete}
+                  onMove={handleCardMove}
+                  onResize={handleCardResize}
+                  onStateChange={handleSwitchStateChange}
+                  isEditing={isEditing}
+                  onEditIcon={handleEditIcon}
+                  onEditTopic={handleEditTopic}
+                  editingCardId={editingCard}
+                />
+              );
+            } else {
+              return (
                 <SensorCard
+                  key={card.id}
                   id={card.id}
                   title={card.title}
                   value={card.value}
@@ -672,6 +886,78 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                   isCalculated={card.isCalculated}
                   allCards={updatedCards}
                 />
+              );
+            }
+          })
+        ) : (
+          // Normal Mode - Absolute layout for consistency
+          <div style={{
+            position: 'relative',
+            width: '100%',
+            height: '600px',
+            padding: '0 20px'
+          }}>
+            {updatedCards.map(card => (
+              <div 
+                key={card.id} 
+                style={{ 
+                  position: 'absolute',
+                  left: `${card.position.x}px`,
+                  top: `${card.position.y}px`,
+                  width: `${card.size.width}px`,
+                  height: `${card.size.height}px`,
+                  zIndex: 1
+                }}
+              >
+                {card.cardType === CardType.SWITCH ? (
+                  <SwitchCard
+                    id={card.id}
+                    title={card.title}
+                    switchData={card.switchData}
+                    position={card.position}
+                    size={card.size}
+                    icon={card.icon}
+                    onEdit={handleCardEdit}
+                    onDelete={handleCardDelete}
+                    onMove={handleCardMove}
+                    onResize={handleCardResize}
+                    onStateChange={handleSwitchStateChange}
+                    isEditing={isEditing}
+                    onEditIcon={handleEditIcon}
+                    onEditTopic={handleEditTopic}
+                    editingCardId={editingCard}
+                  />
+                ) : (
+                  <SensorCard
+                    id={card.id}
+                    title={card.title}
+                    value={card.value}
+                    unit={card.unit}
+                    status={card.status}
+                    lastUpdated={card.lastUpdated}
+                    position={card.position}
+                    size={card.size}
+                    icon={card.icon}
+                    onEdit={handleCardEdit}
+                    onDelete={handleCardDelete}
+                    onMove={handleCardMove}
+                    onResize={handleCardResize}
+                    isEditing={isEditing}
+                    onEditTopic={handleEditTopic}
+                    onEditIcon={handleEditIcon}
+                    editingCardId={editingCard}
+                    displayType={card.displayType}
+                    minValue={card.minValue}
+                    maxValue={card.maxValue}
+                    onEditDisplay={handleEditDisplay}
+                    offset={card.offset}
+                    colorRanges={card.colorRanges}
+                    calculationType={card.calculationType}
+                    sourceCards={card.sourceCards}
+                    isCalculated={card.isCalculated}
+                    allCards={updatedCards}
+                  />
+                )}
               </div>
             ))}
           </div>
@@ -765,11 +1051,11 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                 <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
                   <button
                     type="button"
-                    onClick={() => setNewCardTemplate({...newCardTemplate, isCalculated: false})}
+                    onClick={() => setNewCardTemplate({...newCardTemplate, cardType: 'sensor', isCalculated: false})}
                     style={{
                       padding: '8px 16px',
-                      backgroundColor: !newCardTemplate.isCalculated ? '#667eea' : '#f8fafc',
-                      color: !newCardTemplate.isCalculated ? 'white' : '#64748b',
+                      backgroundColor: newCardTemplate.cardType === 'sensor' ? '#667eea' : '#f8fafc',
+                      color: newCardTemplate.cardType === 'sensor' ? 'white' : '#64748b',
                       border: '1px solid #e2e8f0',
                       borderRadius: '6px',
                       fontSize: '14px',
@@ -781,10 +1067,46 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setNewCardTemplate({...newCardTemplate, isCalculated: true})}
+                    onClick={() => setNewCardTemplate({...newCardTemplate, cardType: 'switch'})}
                     style={{
                       padding: '8px 16px',
-                      backgroundColor: newCardTemplate.isCalculated ? '#667eea' : '#f8fafc',
+                      backgroundColor: newCardTemplate.cardType === 'switch' ? '#667eea' : '#f8fafc',
+                      color: newCardTemplate.cardType === 'switch' ? 'white' : '#64748b',
+                      border: '1px solid #e2e8f0',
+                      borderRadius: '6px',
+                      fontSize: '14px',
+                      cursor: 'pointer',
+                      transition: 'all 0.2s'
+                    }}
+                  >
+                    🔌 스위치 카드
+                  </button>
+                </div>
+                
+                {newCardTemplate.cardType === 'sensor' && (
+                  <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+                    <button
+                      type="button"
+                      onClick={() => setNewCardTemplate({...newCardTemplate, isCalculated: false})}
+                      style={{
+                        padding: '8px 16px',
+                        backgroundColor: !newCardTemplate.isCalculated ? '#4caf50' : '#f8fafc',
+                        color: !newCardTemplate.isCalculated ? 'white' : '#64748b',
+                        border: '1px solid #e2e8f0',
+                        borderRadius: '6px',
+                        fontSize: '14px',
+                        cursor: 'pointer',
+                        transition: 'all 0.2s'
+                      }}
+                    >
+                      📊 일반 센서
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setNewCardTemplate({...newCardTemplate, isCalculated: true})}
+                      style={{
+                        padding: '8px 16px',
+                        backgroundColor: newCardTemplate.isCalculated ? '#4caf50' : '#f8fafc',
                       color: newCardTemplate.isCalculated ? 'white' : '#64748b',
                       border: '1px solid #e2e8f0',
                       borderRadius: '6px',
@@ -796,8 +1118,9 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                     🧮 계산 카드
                   </button>
                 </div>
+                )}
                 
-                {!newCardTemplate.isCalculated && (
+                {newCardTemplate.cardType === 'sensor' && !newCardTemplate.isCalculated && (
                   <select
                     value={newCardTemplate.dataSource}
                     onChange={(e) => {
@@ -822,10 +1145,304 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                     <option value="mqtt">MQTT 토픽 선택</option>
                   </select>
                 )}
+                
+                {newCardTemplate.cardType === 'switch' && (
+                  <div>
+                    <label style={{
+                      display: 'block',
+                      marginBottom: '8px',
+                      fontWeight: '600',
+                      color: '#2c3e50'
+                    }}>
+                      스위치 타입
+                    </label>
+                    <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+                      <button
+                        type="button"
+                        onClick={() => setNewCardTemplate({...newCardTemplate, switchType: 'binary'})}
+                        style={{
+                          padding: '8px 16px',
+                          backgroundColor: newCardTemplate.switchType === 'binary' ? '#2196f3' : '#f8fafc',
+                          color: newCardTemplate.switchType === 'binary' ? 'white' : '#64748b',
+                          border: '1px solid #e2e8f0',
+                          borderRadius: '6px',
+                          fontSize: '14px',
+                          cursor: 'pointer',
+                          transition: 'all 0.2s'
+                        }}
+                      >
+                        ⚡ ON/OFF 스위치
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setNewCardTemplate({...newCardTemplate, switchType: 'triple'})}
+                        style={{
+                          padding: '8px 16px',
+                          backgroundColor: newCardTemplate.switchType === 'triple' ? '#2196f3' : '#f8fafc',
+                          color: newCardTemplate.switchType === 'triple' ? 'white' : '#64748b',
+                          border: '1px solid #e2e8f0',
+                          borderRadius: '6px',
+                          fontSize: '14px',
+                          cursor: 'pointer',
+                          transition: 'all 0.2s'
+                        }}
+                      >
+                        🎚️ 3단계 컨트롤
+                      </button>
+                    </div>
+                    <div style={{
+                      padding: '12px',
+                      backgroundColor: '#f0f4ff',
+                      borderRadius: '8px',
+                      fontSize: '12px',
+                      color: '#667eea'
+                    }}>
+                      {newCardTemplate.switchType === 'binary' 
+                        ? '💡 예: LED 조명, 펌프, 히터 등의 ON/OFF 제어'
+                        : '🪟 예: 창문 개폐, 환풍기 강약 조절, 차광막 제어 등'
+                      }
+                    </div>
+                  </div>
+                )}
+                
+                {/* 스위치 MQTT 설정 */}
+                {newCardTemplate.cardType === 'switch' && (
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', marginBottom: '12px' }}>
+                      <input
+                        type="checkbox"
+                        id="mqttEnabled"
+                        checked={newCardTemplate.mqttEnabled}
+                        onChange={(e) => setNewCardTemplate({...newCardTemplate, mqttEnabled: e.target.checked})}
+                        style={{ marginRight: '8px' }}
+                      />
+                      <label htmlFor="mqttEnabled" style={{
+                        fontWeight: '600',
+                        color: '#2c3e50',
+                        cursor: 'pointer'
+                      }}>
+                        🌐 MQTT 연동 사용
+                      </label>
+                    </div>
+                    
+                    {newCardTemplate.mqttEnabled && (
+                      <div style={{ display: 'grid', gap: '16px' }}>
+                        {/* 상태 토픽 선택 */}
+                        <div>
+                          <label style={{
+                            display: 'block',
+                            marginBottom: '8px',
+                            fontWeight: '600',
+                            color: '#2c3e50'
+                          }}>
+                            📥 상태 토픽 (State Topic)
+                          </label>
+                          <div style={{ display: 'flex', gap: '8px' }}>
+                            <select
+                              value={newCardTemplate.stateTopic}
+                              onChange={(e) => {
+                                const selectedStateTopic = e.target.value;
+                                const allTopics = extractTopicsFromMessages(messages);
+                                const matchingCommand = findMatchingCommandTopic(selectedStateTopic, allTopics);
+                                
+                                setNewCardTemplate({
+                                  ...newCardTemplate, 
+                                  stateTopic: selectedStateTopic,
+                                  commandTopic: matchingCommand || newCardTemplate.commandTopic
+                                });
+                              }}
+                              style={{
+                                flex: 1,
+                                padding: '12px',
+                                border: '1px solid #ddd',
+                                borderRadius: '8px',
+                                fontSize: '14px',
+                                outline: 'none'
+                              }}
+                            >
+                              <option value="">상태 토픽 선택...</option>
+                              {extractTopicsFromMessages(messages).map((topic, index) => (
+                                <option key={index} value={topic}>{topic}</option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const customTopic = prompt('상태 토픽을 직접 입력하세요:', newCardTemplate.stateTopic);
+                                if (customTopic !== null) {
+                                  const allTopics = extractTopicsFromMessages(messages);
+                                  const matchingCommand = findMatchingCommandTopic(customTopic, allTopics);
+                                  setNewCardTemplate({
+                                    ...newCardTemplate, 
+                                    stateTopic: customTopic,
+                                    commandTopic: matchingCommand || newCardTemplate.commandTopic
+                                  });
+                                }
+                              }}
+                              style={{
+                                padding: '12px',
+                                backgroundColor: '#2196f3',
+                                color: 'white',
+                                border: 'none',
+                                borderRadius: '8px',
+                                cursor: 'pointer',
+                                fontSize: '14px'
+                              }}
+                              title="직접 입력"
+                            >
+                              ✏️
+                            </button>
+                          </div>
+                          <div style={{
+                            fontSize: '12px',
+                            color: '#666',
+                            marginTop: '4px'
+                          }}>
+                            현재 스위치 상태를 구독할 토픽 (예: /state, /status) - 직접 입력도 가능
+                          </div>
+                        </div>
+                        
+                        {/* 제어 토픽 선택 */}
+                        <div>
+                          <label style={{
+                            display: 'block',
+                            marginBottom: '8px',
+                            fontWeight: '600',
+                            color: '#2c3e50'
+                          }}>
+                            📤 제어 토픽 (Command Topic)
+                          </label>
+                          <div style={{ display: 'flex', gap: '8px' }}>
+                            <select
+                              value={newCardTemplate.commandTopic}
+                              onChange={(e) => setNewCardTemplate({...newCardTemplate, commandTopic: e.target.value})}
+                              style={{
+                                flex: 1,
+                                padding: '12px',
+                                border: '1px solid #ddd',
+                                borderRadius: '8px',
+                                fontSize: '14px',
+                                outline: 'none'
+                              }}
+                            >
+                              <option value="">제어 토픽 선택...</option>
+                              {extractTopicsFromMessages(messages).map((topic, index) => (
+                                <option key={index} value={topic}>{topic}</option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const customTopic = prompt('제어 토픽을 직접 입력하세요:', newCardTemplate.commandTopic);
+                                if (customTopic !== null) {
+                                  setNewCardTemplate({...newCardTemplate, commandTopic: customTopic});
+                                }
+                              }}
+                              style={{
+                                padding: '12px',
+                                backgroundColor: '#4caf50',
+                                color: 'white',
+                                border: 'none',
+                                borderRadius: '8px',
+                                cursor: 'pointer',
+                                fontSize: '14px'
+                              }}
+                              title="직접 입력"
+                            >
+                              ✏️
+                            </button>
+                          </div>
+                          <div style={{
+                            fontSize: '12px',
+                            color: '#666',
+                            marginTop: '4px'
+                          }}>
+                            스위치 제어 명령을 보낼 토픽 (예: /set, /command) - 직접 입력도 가능
+                          </div>
+                        </div>
+                        
+                        {/* 값 매핑 설정 */}
+                        <div>
+                          <label style={{
+                            display: 'block',
+                            marginBottom: '8px',
+                            fontWeight: '600',
+                            color: '#2c3e50'
+                          }}>
+                            🔄 값 매핑 설정
+                          </label>
+                          <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: newCardTemplate.switchType === 'binary' ? '1fr 1fr' : '1fr 1fr 1fr',
+                            gap: '8px'
+                          }}>
+                            <div>
+                              <label style={{ fontSize: '12px', fontWeight: '500' }}>ON 값</label>
+                              <input
+                                type="text"
+                                value={newCardTemplate.onValue}
+                                onChange={(e) => setNewCardTemplate({...newCardTemplate, onValue: e.target.value})}
+                                placeholder="ON"
+                                style={{
+                                  width: '100%',
+                                  padding: '8px',
+                                  border: '1px solid #ddd',
+                                  borderRadius: '4px',
+                                  fontSize: '12px'
+                                }}
+                              />
+                            </div>
+                            <div>
+                              <label style={{ fontSize: '12px', fontWeight: '500' }}>OFF 값</label>
+                              <input
+                                type="text"
+                                value={newCardTemplate.offValue}
+                                onChange={(e) => setNewCardTemplate({...newCardTemplate, offValue: e.target.value})}
+                                placeholder="OFF"
+                                style={{
+                                  width: '100%',
+                                  padding: '8px',
+                                  border: '1px solid #ddd',
+                                  borderRadius: '4px',
+                                  fontSize: '12px'
+                                }}
+                              />
+                            </div>
+                            {newCardTemplate.switchType === 'triple' && (
+                              <div>
+                                <label style={{ fontSize: '12px', fontWeight: '500' }}>중간 값</label>
+                                <input
+                                  type="text"
+                                  value={newCardTemplate.state2Value}
+                                  onChange={(e) => setNewCardTemplate({...newCardTemplate, state2Value: e.target.value})}
+                                  placeholder="STOP"
+                                  style={{
+                                    width: '100%',
+                                    padding: '8px',
+                                    border: '1px solid #ddd',
+                                    borderRadius: '4px',
+                                    fontSize: '12px'
+                                  }}
+                                />
+                              </div>
+                            )}
+                          </div>
+                          <div style={{
+                            fontSize: '12px',
+                            color: '#666',
+                            marginTop: '4px'
+                          }}>
+                            MQTT 메시지에서 사용할 값 (예: ON/OFF, 1/0, true/false)
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
               
               {/* 계산 카드 설정 */}
-              {newCardTemplate.isCalculated && (
+              {newCardTemplate.cardType === 'sensor' && newCardTemplate.isCalculated && (
                 <div style={{ display: 'grid', gap: '16px' }}>
                   <div>
                     <label style={{
@@ -876,7 +1493,7 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                       borderRadius: '8px',
                       padding: '8px'
                     }}>
-                      {cards.filter(card => !card.isCalculated).map(card => (
+                      {cards.filter(card => card.cardType === CardType.SENSOR && !card.isCalculated).map(card => (
                         <label key={card.id} style={{
                           display: 'flex',
                           alignItems: 'center',
@@ -930,7 +1547,7 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                 </div>
               )}
               
-              {newCardTemplate.dataSource === 'mqtt' && !newCardTemplate.isCalculated && (
+              {newCardTemplate.cardType === 'sensor' && newCardTemplate.dataSource === 'mqtt' && !newCardTemplate.isCalculated && (
                 <div>
                   <label style={{
                     display: 'block',
@@ -1004,7 +1621,7 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                   maxHeight: '120px',
                   overflowY: 'auto'
                 }}>
-                  {SENSOR_ICONS.map((iconOption, index) => (
+                  {(newCardTemplate.cardType === 'switch' ? SWITCH_ICONS : SENSOR_ICONS).map((iconOption, index) => (
                     <button
                       key={index}
                       type="button"
@@ -1151,14 +1768,18 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                 <button
                   onClick={handleAddCard}
                   disabled={
-                    (newCardTemplate.dataSource === 'mqtt' && !selectedTopic && !newCardTemplate.isCalculated) ||
-                    (newCardTemplate.isCalculated && newCardTemplate.sourceCards.length === 0)
+                    newCardTemplate.cardType === 'sensor' && (
+                      (newCardTemplate.dataSource === 'mqtt' && !selectedTopic && !newCardTemplate.isCalculated) ||
+                      (newCardTemplate.isCalculated && newCardTemplate.sourceCards.length === 0)
+                    )
                   }
                   style={{
                     padding: '12px 24px',
                     backgroundColor: (
-                      (newCardTemplate.dataSource === 'mqtt' && !selectedTopic && !newCardTemplate.isCalculated) ||
-                      (newCardTemplate.isCalculated && newCardTemplate.sourceCards.length === 0)
+                      newCardTemplate.cardType === 'sensor' && (
+                        (newCardTemplate.dataSource === 'mqtt' && !selectedTopic && !newCardTemplate.isCalculated) ||
+                        (newCardTemplate.isCalculated && newCardTemplate.sourceCards.length === 0)
+                      )
                     ) ? '#ccc' : '#4caf50',
                     color: 'white',
                     border: 'none',
@@ -1166,8 +1787,10 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                     fontSize: '14px',
                     fontWeight: '600',
                     cursor: (
-                      (newCardTemplate.dataSource === 'mqtt' && !selectedTopic && !newCardTemplate.isCalculated) ||
-                      (newCardTemplate.isCalculated && newCardTemplate.sourceCards.length === 0)
+                      newCardTemplate.cardType === 'sensor' && (
+                        (newCardTemplate.dataSource === 'mqtt' && !selectedTopic && !newCardTemplate.isCalculated) ||
+                        (newCardTemplate.isCalculated && newCardTemplate.sourceCards.length === 0)
+                      )
                     ) ? 'not-allowed' : 'pointer'
                   }}
                 >
@@ -1229,48 +1852,209 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
               flexDirection: 'column',
               gap: '16px'
             }}>
-              <div>
-                <label style={{
-                  display: 'block',
-                  marginBottom: '8px',
-                  fontWeight: '600',
-                  color: '#2c3e50'
-                }}>
-                  새 토픽 선택
-                </label>
-                <select
-                  value={selectedTopic}
-                  onChange={(e) => setSelectedTopic(e.target.value)}
-                  style={{
-                    width: '100%',
-                    padding: '12px',
-                    border: '1px solid #ddd',
-                    borderRadius: '8px',
-                    fontSize: '14px',
-                    outline: 'none'
-                  }}
-                >
-                  <option value="">토픽 선택...</option>
-                  {numericTopics.map(topic => (
-                    <option key={topic} value={topic}>
-                      {topic} ({getLatestValueForTopic(messages, topic)})
-                    </option>
-                  ))}
-                </select>
-              </div>
-              
-              {selectedTopic && (
-                <div style={{
-                  backgroundColor: '#f8fafc',
-                  padding: '12px',
-                  borderRadius: '8px',
-                  fontSize: '14px'
-                }}>
-                  <strong>미리보기:</strong><br/>
-                  제목: {guessTopicDisplayName(selectedTopic)}<br/>
-                  단위: {guessTopicUnit(selectedTopic) || '없음'}<br/>
-                  현재 값: {getLatestValueForTopic(messages, selectedTopic)}
-                </div>
+              {editingCard && cards.find(c => c.id === editingCard)?.cardType === CardType.SWITCH ? (
+                // 스위치 카드 MQTT 설정
+                <>
+                  <div>
+                    <label style={{
+                      display: 'block',
+                      marginBottom: '8px',
+                      fontWeight: '600',
+                      color: '#2c3e50'
+                    }}>
+                      상태 토픽 (State Topic)
+                    </label>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <input
+                        type="text"
+                        value={newCardTemplate.stateTopic}
+                        onChange={(e) => setNewCardTemplate(prev => ({ ...prev, stateTopic: e.target.value }))}
+                        placeholder="상태 토픽을 입력하세요 (예: homeassistant/switch/light1/state)"
+                        style={{
+                          width: '100%',
+                          padding: '12px',
+                          border: '1px solid #ddd',
+                          borderRadius: '8px',
+                          fontSize: '14px',
+                          outline: 'none'
+                        }}
+                      />
+                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: '12px', color: '#666', marginBottom: '4px' }}>
+                          추천 토픽:
+                        </span>
+                        {availableTopics.filter(topic => 
+                          topic.toLowerCase().includes('state') || 
+                          topic.toLowerCase().includes('status') || 
+                          topic.toLowerCase().includes('get') ||
+                          topic.toLowerCase().includes('current')
+                        ).slice(0, 3).map(topic => (
+                          <button
+                            key={topic}
+                            onClick={() => setNewCardTemplate(prev => ({ ...prev, stateTopic: topic }))}
+                            style={{
+                              padding: '4px 8px',
+                              fontSize: '11px',
+                              backgroundColor: '#f0f8ff',
+                              border: '1px solid #4caf50',
+                              borderRadius: '4px',
+                              color: '#388e3c',
+                              cursor: 'pointer',
+                              whiteSpace: 'nowrap'
+                            }}
+                          >
+                            {topic.length > 30 ? `...${topic.slice(-27)}` : topic}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label style={{
+                      display: 'block',
+                      marginBottom: '8px',
+                      fontWeight: '600',
+                      color: '#2c3e50'
+                    }}>
+                      제어 토픽 (Command Topic)
+                    </label>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <input
+                        type="text"
+                        value={newCardTemplate.commandTopic}
+                        onChange={(e) => setNewCardTemplate(prev => ({ ...prev, commandTopic: e.target.value }))}
+                        placeholder="제어 토픽을 입력하세요 (예: homeassistant/switch/light1/set)"
+                        style={{
+                          width: '100%',
+                          padding: '12px',
+                          border: '1px solid #ddd',
+                          borderRadius: '8px',
+                          fontSize: '14px',
+                          outline: 'none'
+                        }}
+                      />
+                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: '12px', color: '#666', marginBottom: '4px' }}>
+                          추천 토픽:
+                        </span>
+                        {availableTopics.filter(topic => 
+                          topic.toLowerCase().includes('set') || 
+                          topic.toLowerCase().includes('command') || 
+                          topic.toLowerCase().includes('control') ||
+                          topic.toLowerCase().includes('cmd')
+                        ).slice(0, 3).map(topic => (
+                          <button
+                            key={topic}
+                            onClick={() => setNewCardTemplate(prev => ({ ...prev, commandTopic: topic }))}
+                            style={{
+                              padding: '4px 8px',
+                              fontSize: '11px',
+                              backgroundColor: '#f0f4ff',
+                              border: '1px solid #2196f3',
+                              borderRadius: '4px',
+                              color: '#1976d2',
+                              cursor: 'pointer',
+                              whiteSpace: 'nowrap'
+                            }}
+                          >
+                            {topic.length > 30 ? `...${topic.slice(-27)}` : topic}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label style={{
+                      display: 'block',
+                      marginBottom: '8px',
+                      fontWeight: '600',
+                      color: '#2c3e50'
+                    }}>
+                      값 매핑 설정
+                    </label>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                      <div>
+                        <label style={{ fontSize: '12px', color: '#666' }}>ON 값</label>
+                        <input
+                          type="text"
+                          value={newCardTemplate.onValue}
+                          onChange={(e) => setNewCardTemplate(prev => ({ ...prev, onValue: e.target.value }))}
+                          style={{
+                            width: '100%',
+                            padding: '8px',
+                            border: '1px solid #ddd',
+                            borderRadius: '4px',
+                            fontSize: '14px'
+                          }}
+                        />
+                      </div>
+                      <div>
+                        <label style={{ fontSize: '12px', color: '#666' }}>OFF 값</label>
+                        <input
+                          type="text"
+                          value={newCardTemplate.offValue}
+                          onChange={(e) => setNewCardTemplate(prev => ({ ...prev, offValue: e.target.value }))}
+                          style={{
+                            width: '100%',
+                            padding: '8px',
+                            border: '1px solid #ddd',
+                            borderRadius: '4px',
+                            fontSize: '14px'
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                // 센서 카드 토픽 설정
+                <>
+                  <div>
+                    <label style={{
+                      display: 'block',
+                      marginBottom: '8px',
+                      fontWeight: '600',
+                      color: '#2c3e50'
+                    }}>
+                      새 토픽 선택
+                    </label>
+                    <select
+                      value={selectedTopic}
+                      onChange={(e) => setSelectedTopic(e.target.value)}
+                      style={{
+                        width: '100%',
+                        padding: '12px',
+                        border: '1px solid #ddd',
+                        borderRadius: '8px',
+                        fontSize: '14px',
+                        outline: 'none'
+                      }}
+                    >
+                      <option value="">토픽 선택...</option>
+                      {numericTopics.map(topic => (
+                        <option key={topic} value={topic}>
+                          {topic} ({getLatestValueForTopic(messages, topic)})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  
+                  {selectedTopic && (
+                    <div style={{
+                      backgroundColor: '#f8fafc',
+                      padding: '12px',
+                      borderRadius: '8px',
+                      fontSize: '14px'
+                    }}>
+                      <strong>미리보기:</strong><br/>
+                      제목: {guessTopicDisplayName(selectedTopic)}<br/>
+                      단위: {guessTopicUnit(selectedTopic) || '없음'}<br/>
+                      현재 값: {getLatestValueForTopic(messages, selectedTopic)}
+                    </div>
+                  )}
+                </>
               )}
             </div>
             
@@ -1307,16 +2091,28 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                 </button>
                 <button
                   onClick={() => handleSaveTopicEdit(selectedTopic)}
-                  disabled={!selectedTopic}
+                  disabled={
+                    editingCard && cards.find(c => c.id === editingCard)?.cardType === CardType.SWITCH 
+                      ? !newCardTemplate.stateTopic && !newCardTemplate.commandTopic
+                      : !selectedTopic
+                  }
                   style={{
                     padding: '12px 24px',
-                    backgroundColor: !selectedTopic ? '#ccc' : '#2196f3',
+                    backgroundColor: (
+                      editingCard && cards.find(c => c.id === editingCard)?.cardType === CardType.SWITCH 
+                        ? !newCardTemplate.stateTopic && !newCardTemplate.commandTopic
+                        : !selectedTopic
+                    ) ? '#ccc' : '#2196f3',
                     color: 'white',
                     border: 'none',
                     borderRadius: '8px',
                     fontSize: '14px',
                     fontWeight: '600',
-                    cursor: !selectedTopic ? 'not-allowed' : 'pointer'
+                    cursor: (
+                      editingCard && cards.find(c => c.id === editingCard)?.cardType === CardType.SWITCH 
+                        ? !newCardTemplate.stateTopic && !newCardTemplate.commandTopic
+                        : !selectedTopic
+                    ) ? 'not-allowed' : 'pointer'
                   }}
                 >
                   저장
@@ -1397,11 +2193,14 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                   maxHeight: '300px',
                   overflowY: 'auto'
                 }}>
-                  {SENSOR_ICONS.map((iconOption, index) => (
-                    <button
-                      key={index}
-                      type="button"
-                      onClick={() => setSelectedIcon(iconOption)}
+                  {(() => {
+                    const currentCard = cards.find(card => card.id === editingCard);
+                    const iconArray = currentCard?.cardType === CardType.SWITCH ? SWITCH_ICONS : SENSOR_ICONS;
+                    return iconArray.map((iconOption, index) => (
+                      <button
+                        key={index}
+                        type="button"
+                        onClick={() => setSelectedIcon(iconOption)}
                       style={{
                         padding: '8px',
                         border: selectedIcon === iconOption ? '2px solid #667eea' : '1px solid #e2e8f0',
@@ -1427,8 +2226,9 @@ const SensorCardManager: React.FC<SensorCardManagerProps> = ({
                       }}
                     >
                       {iconOption}
-                    </button>
-                  ))}
+                      </button>
+                    ));
+                  })()}
                 </div>
               </div>
               

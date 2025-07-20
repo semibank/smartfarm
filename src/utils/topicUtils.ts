@@ -188,6 +188,117 @@ export const SENSOR_ICONS = [
   '📔', '📕', '📖', '📗', '📘', '📙', '📚', '📛', '📜'
 ];
 
+// 스위치 카드 전용 아이콘
+export const SWITCH_ICONS = [
+  // 조명 관련
+  '💡', '🔆', '🌟', '✨', '🔅', '💫', '🌠', '🕯️',
+  
+  // 전원 및 전기
+  '⚡', '🔌', '🔋', '⚡', '🔘', '🔴', '🟢', '🟡',
+  
+  // 히터 및 냉각
+  '🔥', '🌡️', '♨️', '🥵', '❄️', '🧊', '🥶', '🌨️',
+  
+  // 펌프 및 급수
+  '💧', '🚿', '🚰', '⛲', '💦', '🌊', '🌀', '♻️',
+  
+  // 팬 및 환기
+  '🌪️', '💨', '🌬️', '🍃', '🔄', '↩️', '↪️', '🔃',
+  
+  // 창문 및 도어
+  '🚪', '🪟', '🏠', '🏡', '🔓', '🔒', '🗝️', '🔑',
+  
+  // 모터 및 기계
+  '⚙️', '🔧', '🔩', '🛠️', '🔨', '⚒️', '🧰', '⛏️',
+  
+  // 농업 장비
+  '🚜', '🌾', '🌿', '🌱', '🪴', '🌳', '🍀', '🌽',
+  
+  // 알람 및 경고
+  '🚨', '⚠️', '🔔', '📢', '📯', '🚩', '⛔', '🛑',
+  
+  // 기타 제어
+  '🎛️', '🎚️', '📟', '📱', '⌚', '🕹️', '🎮', '📡'
+];
+
+// 스위치 토픽 필터링 패턴
+export const SWITCH_DEVICE_PATTERNS = [
+  /\/switch\//i, /\/relay\//i, /\/light\//i, 
+  /\/outlet\//i, /\/plug\//i, /\/fan\//i,
+  /\/heater\//i, /\/pump\//i, /\/valve\//i,
+  /\/motor\//i, /\/actuator\//i, /\/control\//i
+];
+
+export const STATE_TOPIC_PATTERNS = [
+  /\/state$/i, /\/status$/i, /\/get$/i, /\/current$/i
+];
+
+export const COMMAND_TOPIC_PATTERNS = [
+  /\/set$/i, /\/command$/i, /\/control$/i, /\/cmd$/i
+];
+
+// 스위치 토픽 필터링 함수
+export const filterSwitchTopics = (topics: string[]): string[] => {
+  return topics.filter(topic => 
+    SWITCH_DEVICE_PATTERNS.some(pattern => pattern.test(topic))
+  );
+};
+
+// 상태 토픽 필터링
+export const filterStateTopics = (topics: string[]): string[] => {
+  return topics.filter(topic => 
+    STATE_TOPIC_PATTERNS.some(pattern => pattern.test(topic))
+  );
+};
+
+// 제어 토픽 필터링
+export const filterCommandTopics = (topics: string[]): string[] => {
+  return topics.filter(topic => 
+    COMMAND_TOPIC_PATTERNS.some(pattern => pattern.test(topic))
+  );
+};
+
+// 토픽 페어 자동 매칭 (state ↔ command)
+export const findMatchingCommandTopic = (stateTopic: string, allTopics: string[]): string | null => {
+  // state 토픽에서 패턴 제거하고 base path 추출
+  const basePath = stateTopic.replace(/\/(state|status|get|current)$/i, '');
+  
+  // 가능한 command 토픽들 생성
+  const possibleCommands = [
+    `${basePath}/set`,
+    `${basePath}/command`,
+    `${basePath}/control`,
+    `${basePath}/cmd`
+  ];
+  
+  // 실제로 존재하는 토픽 찾기
+  for (const cmdTopic of possibleCommands) {
+    if (allTopics.some(topic => topic.toLowerCase() === cmdTopic.toLowerCase())) {
+      return cmdTopic;
+    }
+  }
+  
+  return null;
+};
+
+// 기본 값 매핑 생성
+export const createDefaultValueMapping = (switchType: 'BINARY' | 'TRIPLE') => {
+  if (switchType === 'BINARY') {
+    return {
+      on: 'ON',
+      off: 'OFF'
+    };
+  } else {
+    return {
+      on: 'ON',
+      off: 'OFF',
+      state1: 'CLOSE',
+      state2: 'STOP', 
+      state3: 'OPEN'
+    };
+  }
+};
+
 // Common sensor units for selection
 export const COMMON_UNITS = [
   // Temperature

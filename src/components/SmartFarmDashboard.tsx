@@ -9,7 +9,7 @@ import { MqttTreeParser } from '../utils/mqttTreeParser';
 import type { MqttTreeNode } from '../types/MqttTree';
 import { extractTopicsFromMessages, getLatestValueForTopic, isNumericTopic } from '../utils/topicUtils';
 import { loadDashboardSettings, saveDashboardSettings, type DashboardSettings } from '../utils/settingsStorage';
-import { loadCardConfigs, type SensorCardConfig } from '../utils/cardStorage';
+import { loadCardConfigs, type CardConfig } from '../utils/cardStorage';
 import { dataHistoryManager } from '../utils/dataHistory';
 
 interface SensorData {
@@ -43,7 +43,7 @@ const SmartFarmDashboard: React.FC = () => {
   const [isInitializing, setIsInitializing] = useState(true);
   
   const [dashboardSettings, setDashboardSettings] = useState<DashboardSettings>(loadDashboardSettings());
-  const [cards, setCards] = useState<SensorCardConfig[]>([]);
+  const [cards, setCards] = useState<CardConfig[]>([]);
 
   // Initialize cards on component mount
   useEffect(() => {
@@ -73,7 +73,7 @@ const SmartFarmDashboard: React.FC = () => {
     }
   }), [mqttConfig]);
 
-  const { messages, isConnected, connectionStatus } = useMqtt(mqttHookConfig);
+  const { messages, isConnected, connectionStatus, publish } = useMqtt(mqttHookConfig);
 
   const handleMqttConfigSave = (newConfig: MqttConfig) => {
     setMqttConfig(newConfig);
@@ -118,6 +118,7 @@ const SmartFarmDashboard: React.FC = () => {
       <SensorCardManager
         sensorData={sensorData}
         messages={messages}
+        publish={publish}
         getTemperatureStatus={getTemperatureStatus}
         getHumidityStatus={getHumidityStatus}
         getSoilMoistureStatus={getSoilMoistureStatus}
@@ -354,19 +355,212 @@ const SmartFarmDashboard: React.FC = () => {
       backgroundColor: 'rgba(255, 255, 255, 0.95)',
       backdropFilter: 'blur(20px)',
       borderRadius: '24px',
-      padding: '40px',
       border: '1px solid rgba(255, 255, 255, 0.3)',
       boxShadow: '0 20px 40px rgba(0, 0, 0, 0.1)',
       margin: '0 20px',
-      textAlign: 'center'
+      height: 'calc(100vh - 160px)',
+      display: 'flex',
+      flexDirection: 'column',
+      overflow: 'hidden'
     }}>
-      <h3 style={{ color: '#2c3e50', marginBottom: '20px' }}>🌳 MQTT 로그</h3>
-      <p style={{ color: '#7f8c8d' }}>MQTT 로그 기능이 곧 추가될 예정입니다.</p>
-      <div style={{ marginTop: '20px', padding: '20px', backgroundColor: '#f8fafc', borderRadius: '12px' }}>
-        <p style={{ color: '#64748b', margin: 0, fontSize: '14px' }}>
-          메시지 수: {messages.length}개<br/>
-          토픽 수: {extractTopicsFromMessages(messages).length}개
-        </p>
+      {/* Header */}
+      <div style={{
+        padding: '24px 32px 16px 32px',
+        borderBottom: '1px solid rgba(226, 232, 240, 0.5)',
+        flexShrink: 0
+      }}>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          marginBottom: '16px'
+        }}>
+          <div style={{
+            display: 'flex',
+            alignItems: 'center'
+          }}>
+            <div style={{
+              width: '4px',
+              height: '24px',
+              backgroundColor: '#667eea',
+              borderRadius: '2px',
+              marginRight: '16px'
+            }} />
+            <h3 style={{ 
+              margin: 0,
+              fontSize: '20px',
+              fontWeight: '600',
+              color: '#2c3e50'
+            }}>
+              🌳 MQTT 로그 트리
+            </h3>
+          </div>
+          
+          <div style={{
+            display: 'flex',
+            gap: '16px',
+            alignItems: 'center'
+          }}>
+            <div style={{
+              padding: '8px 12px',
+              backgroundColor: '#f0f4ff',
+              borderRadius: '8px',
+              fontSize: '12px',
+              color: '#4338ca',
+              fontWeight: '500'
+            }}>
+              메시지 {messages.length}개
+            </div>
+            <div style={{
+              padding: '8px 12px',
+              backgroundColor: '#f0fdf4',
+              borderRadius: '8px',
+              fontSize: '12px',
+              color: '#059669',
+              fontWeight: '500'
+            }}>
+              토픽 {extractTopicsFromMessages(messages).length}개
+            </div>
+            <div style={{
+              padding: '8px 12px',
+              backgroundColor: isConnected ? '#f0fdf4' : '#fef2f2',
+              borderRadius: '8px',
+              fontSize: '12px',
+              color: isConnected ? '#059669' : '#dc2626',
+              fontWeight: '500',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '4px'
+            }}>
+              <div style={{
+                width: '6px',
+                height: '6px',
+                borderRadius: '50%',
+                backgroundColor: isConnected ? '#10b981' : '#ef4444'
+              }} />
+              {isConnected ? '연결됨' : '연결끊김'}
+            </div>
+          </div>
+        </div>
+        
+        {/* Filter */}
+        <div style={{
+          display: 'flex',
+          gap: '12px',
+          alignItems: 'center'
+        }}>
+          <input
+            type="text"
+            placeholder="토픽 또는 메시지 내용으로 필터링..."
+            value={messageFilter}
+            onChange={(e) => setMessageFilter(e.target.value)}
+            style={{
+              flex: 1,
+              padding: '10px 16px',
+              border: '1px solid #e2e8f0',
+              borderRadius: '12px',
+              fontSize: '14px',
+              outline: 'none',
+              backgroundColor: 'white',
+              transition: 'border-color 0.2s'
+            }}
+            onFocus={(e) => e.target.style.borderColor = '#667eea'}
+            onBlur={(e) => e.target.style.borderColor = '#e2e8f0'}
+          />
+          {messageFilter && (
+            <button
+              onClick={clearFilter}
+              style={{
+                padding: '10px 16px',
+                backgroundColor: '#f1f5f9',
+                border: '1px solid #e2e8f0',
+                borderRadius: '12px',
+                color: '#64748b',
+                cursor: 'pointer',
+                fontSize: '14px',
+                transition: 'all 0.2s'
+              }}
+              onMouseOver={(e) => {
+                e.currentTarget.style.backgroundColor = '#e2e8f0';
+                e.currentTarget.style.color = '#475569';
+              }}
+              onMouseOut={(e) => {
+                e.currentTarget.style.backgroundColor = '#f1f5f9';
+                e.currentTarget.style.color = '#64748b';
+              }}
+            >
+              ✕ 클리어
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* MQTT Tree Content - Scrollable */}
+      <div style={{
+        flex: 1,
+        overflow: 'auto',
+        padding: '20px 32px',
+        position: 'relative',
+        scrollbarWidth: 'thin',
+        scrollbarColor: '#cbd5e0 #f7fafc'
+      }}>
+        {mqttTree ? (
+          <div style={{
+            minWidth: 'max-content',
+            minHeight: '100%',
+            paddingBottom: '20px',
+            paddingRight: '40px'
+          }}>
+            <MqttTreeView node={mqttTree} />
+          </div>
+        ) : (
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            height: '100%',
+            color: '#64748b',
+            textAlign: 'center'
+          }}>
+            <div style={{
+              fontSize: '48px',
+              marginBottom: '16px',
+              opacity: 0.5
+            }}>
+              🌳
+            </div>
+            <h4 style={{
+              margin: '0 0 8px 0',
+              color: '#475569',
+              fontSize: '18px',
+              fontWeight: '600'
+            }}>
+              MQTT 메시지 대기 중
+            </h4>
+            <p style={{
+              margin: 0,
+              fontSize: '14px',
+              lineHeight: '1.5'
+            }}>
+              MQTT 브로커에 연결되면 토픽 트리가 여기에 표시됩니다.<br/>
+              설정 탭에서 MQTT 연결을 확인해주세요.
+            </p>
+            {!isConnected && (
+              <div style={{
+                marginTop: '16px',
+                padding: '12px 20px',
+                backgroundColor: '#fef2f2',
+                borderRadius: '12px',
+                border: '1px solid #fecaca',
+                color: '#dc2626',
+                fontSize: '14px'
+              }}>
+                ⚠️ MQTT 브로커에 연결되지 않았습니다
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -515,6 +709,229 @@ const SmartFarmDashboard: React.FC = () => {
         >
           💾 설정 저장
         </button>
+      </div>
+
+      {/* MQTT 테스트 섹션 */}
+      <div style={{
+        marginTop: '32px',
+        padding: '24px',
+        backgroundColor: '#f8fafc',
+        borderRadius: '16px',
+        border: '1px solid #e2e8f0'
+      }}>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          marginBottom: '16px'
+        }}>
+          <div style={{
+            width: '4px',
+            height: '20px',
+            backgroundColor: '#059669',
+            borderRadius: '2px',
+            marginRight: '12px'
+          }} />
+          <h4 style={{ 
+            margin: 0,
+            fontSize: '16px',
+            fontWeight: '600',
+            color: '#2c3e50'
+          }}>
+            🧪 MQTT 테스트
+          </h4>
+          <div style={{
+            marginLeft: '16px',
+            padding: '4px 8px',
+            backgroundColor: isConnected ? '#10b981' : '#ef4444',
+            color: 'white',
+            borderRadius: '6px',
+            fontSize: '12px',
+            fontWeight: '500'
+          }}>
+            {isConnected ? '연결됨' : '연결끊김'}
+          </div>
+        </div>
+
+        <div style={{ display: 'grid', gap: '16px', gridTemplateColumns: '1fr 1fr' }}>
+          <div>
+            <label style={{ 
+              display: 'block',
+              marginBottom: '6px',
+              fontWeight: '500',
+              color: '#374151',
+              fontSize: '14px'
+            }}>
+              테스트 토픽
+            </label>
+            <input
+              type="text"
+              placeholder="예: homeassistant/switch/test/set"
+              style={{
+                width: '100%',
+                padding: '8px 12px',
+                border: '1px solid #d1d5db',
+                borderRadius: '6px',
+                fontSize: '14px',
+                outline: 'none'
+              }}
+              id="testTopic"
+            />
+          </div>
+          <div>
+            <label style={{ 
+              display: 'block',
+              marginBottom: '6px',
+              fontWeight: '500',
+              color: '#374151',
+              fontSize: '14px'
+            }}>
+              테스트 메시지
+            </label>
+            <input
+              type="text"
+              placeholder="예: ON, OFF, 1, 0"
+              style={{
+                width: '100%',
+                padding: '8px 12px',
+                border: '1px solid #d1d5db',
+                borderRadius: '6px',
+                fontSize: '14px',
+                outline: 'none'
+              }}
+              id="testMessage"
+            />
+          </div>
+        </div>
+
+        <div style={{ marginTop: '16px', display: 'flex', gap: '12px' }}>
+          <button
+            onClick={() => {
+              const topicInput = document.getElementById('testTopic') as HTMLInputElement;
+              const messageInput = document.getElementById('testMessage') as HTMLInputElement;
+              const topic = topicInput?.value;
+              const message = messageInput?.value;
+              
+              if (topic && message) {
+                console.log(`🧪 수동 MQTT 테스트 - 토픽: ${topic}, 메시지: ${message}`);
+                publish(topic, message);
+              } else {
+                alert('토픽과 메시지를 입력해주세요.');
+              }
+            }}
+            disabled={!isConnected}
+            style={{
+              padding: '8px 16px',
+              backgroundColor: !isConnected ? '#9ca3af' : '#059669',
+              color: 'white',
+              border: 'none',
+              borderRadius: '6px',
+              fontSize: '14px',
+              fontWeight: '500',
+              cursor: !isConnected ? 'not-allowed' : 'pointer',
+              transition: 'background-color 0.2s'
+            }}
+            onMouseOver={(e) => {
+              if (isConnected) {
+                e.currentTarget.style.backgroundColor = '#047857';
+              }
+            }}
+            onMouseOut={(e) => {
+              if (isConnected) {
+                e.currentTarget.style.backgroundColor = '#059669';
+              }
+            }}
+          >
+            📤 메시지 전송
+          </button>
+          
+          <button
+            onClick={() => {
+              const topicInput = document.getElementById('testTopic') as HTMLInputElement;
+              const messageInput = document.getElementById('testMessage') as HTMLInputElement;
+              
+              // 투야 홈어시스턴트 샘플 설정
+              if (topicInput) topicInput.value = 'homeassistant/switch/tuya_test/set';
+              if (messageInput) messageInput.value = 'ON';
+            }}
+            style={{
+              padding: '8px 16px',
+              backgroundColor: '#6366f1',
+              color: 'white',
+              border: 'none',
+              borderRadius: '6px',
+              fontSize: '14px',
+              fontWeight: '500',
+              cursor: 'pointer',
+              transition: 'background-color 0.2s'
+            }}
+            onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#4f46e5'}
+            onMouseOut={(e) => e.currentTarget.style.backgroundColor = '#6366f1'}
+          >
+            🏠 투야 샘플
+          </button>
+        </div>
+
+        <div style={{
+          marginTop: '12px',
+          padding: '8px 12px',
+          backgroundColor: '#fff7ed',
+          borderRadius: '6px',
+          fontSize: '12px',
+          color: '#9a3412',
+          lineHeight: '1.4'
+        }}>
+          💡 팁: 브라우저 개발자 도구(F12) → Console 탭에서 자세한 MQTT 로그를 확인할 수 있습니다.
+        </div>
+
+        {/* 최근 MQTT 메시지 모니터 */}
+        <div style={{
+          marginTop: '16px',
+          padding: '16px',
+          backgroundColor: '#1f2937',
+          borderRadius: '8px',
+          maxHeight: '200px',
+          overflow: 'auto'
+        }}>
+          <div style={{
+            color: '#10b981',
+            fontSize: '12px',
+            fontWeight: '600',
+            marginBottom: '8px',
+            fontFamily: 'monospace'
+          }}>
+            📡 실시간 MQTT 로그 (최근 10개)
+          </div>
+          {messages.slice(-10).reverse().map((msg, index) => (
+            <div key={index} style={{
+              color: '#e5e7eb',
+              fontSize: '11px',
+              fontFamily: 'monospace',
+              marginBottom: '4px',
+              paddingBottom: '4px',
+              borderBottom: '1px solid #374151'
+            }}>
+              <div style={{ color: '#60a5fa' }}>
+                [{msg.timestamp.toLocaleTimeString()}] {msg.topic}
+              </div>
+              <div style={{ 
+                color: '#fbbf24',
+                paddingLeft: '16px',
+                wordBreak: 'break-all'
+              }}>
+                → {msg.message}
+              </div>
+            </div>
+          ))}
+          {messages.length === 0 && (
+            <div style={{
+              color: '#9ca3af',
+              fontSize: '11px',
+              fontStyle: 'italic'
+            }}>
+              MQTT 메시지 대기 중...
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

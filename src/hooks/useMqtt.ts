@@ -113,8 +113,34 @@ export const useMqtt = ({ brokerUrl, topics, options }: UseMqttOptions) => {
   }, [brokerUrl]);
 
   const publish = (topic: string, message: string) => {
-    if (client && isConnected) {
-      client.publish(topic, message);
+    console.log(`🚀 MQTT Publish 요청:`, {
+      topic,
+      message,
+      clientConnected: !!client,
+      isConnected,
+      timestamp: new Date().toISOString()
+    });
+    
+    if (!client) {
+      console.error(`❌ MQTT client가 없음`);
+      return;
+    }
+    
+    if (!isConnected) {
+      console.error(`❌ MQTT 연결되지 않음`);
+      return;
+    }
+    
+    try {
+      client.publish(topic, message, (error) => {
+        if (error) {
+          console.error(`❌ MQTT Publish 실패:`, error);
+        } else {
+          console.log(`✅ MQTT Publish 성공: ${topic} = "${message}"`);
+        }
+      });
+    } catch (error) {
+      console.error(`❌ MQTT Publish 예외:`, error);
     }
   };
 
